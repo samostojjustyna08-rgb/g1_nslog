@@ -1,92 +1,108 @@
 import streamlit as st
 from st_supabase_connection import SupabaseConnection
+import pandas as pd
+import altair as alt
 
 # Konfiguracja strony
-st.set_page_config(page_title="Zarządzanie Sklepem", layout="wide")
+st.set_page_config(page_title="Baza Danych Produktów", layout="wide")
 
 # Inicjalizacja połączenia z Supabase
-# Dane uwierzytelniające należy dodać w .streamlit/secrets.toml lub w Settings na Streamlit Cloud
 conn = st.connection("supabase", type=SupabaseConnection)
 
-st.title("📦 System Zarządzania Produktami")
+# Funkcja pomocnicza do mapowania kolorów kategorii
+def get_category_color(cat_name):
+    colors = {
+        "mleko": "#1E90FF",      # Niebieski
+        "elektronika": "#2E8B57", # Zielony
+        "owoce": "#FF4500",      # Pomarańczowy/Czerwony
+        "warzywa": "#32CD32",    # Limonkowy
+        "nabiał": "#F0E68C"       # Żółty/Khaki
+    }
+    # Zwróć kolor z mapy lub szary dla nieznanych
+    return colors.get(cat_name.lower(), "#808080")
 
-tabs = st.tabs(["Produkty", "Kategorie"])
+st.title("📊 Baza Danych Produktów")
 
-# --- TAB: KATEGORIE ---
-with tabs[1]:
-    st.header("Zarządzanie Kategoriami")
-    
-    # Formularz dodawania kategorii
-    with st.expander("➕ Dodaj nową kategorię"):
-        with st.form("add_category"):
-            nazwa_kat = st.text_input("Nazwa kategorii")
-            opis_kat = st.text_area("Opis")
-            submit_kat = st.form_submit_button("Zapisz kategorię")
-            
-            if submit_kat and nazwa_kat:
-                conn.table("kategorie").insert({"nazwa": nazwa_kat, "opis": opis_kat}).execute()
-                st.success(f"Dodano kategorię: {nazwa_kat}")
-                st.rerun()
+tabs = st.tabs(["📈 Statystyki i Wykresy", "📦 Produkty", "📁 Kategorie"])
 
-    # Wyświetlanie i usuwanie kategorii
-    kat_data = conn.table("kategorie").select("*").execute()
-    if kat_data.data:
-        for kat in kat_data.data:
-            col1, col2 = st.columns([4, 1])
-            col1.write(f"**{kat['nazwa']}** - {kat['opis']}")
-            if col2.button("Usuń", key=f"del_kat_{kat['id']}"):
-                conn.table("kategorie").delete().eq("id", kat['id']).execute()
-                st.rerun()
+# Pobranie danych do cache'owania w ramach sesji (ułatwia rysowanie wykresów)
+prod_query = conn.table("produkty").select("*, kategorie(nazwa)").execute()
+kat_query = conn.table("kategorie").select("*").execute()
+
+df_prod = pd.DataFrame(prod_query.data) if prod_query.data else pd.DataFrame()
+df_kat = pd.DataFrame(kat_query.data) if kat_query.data else pd.DataFrame()
+
+# Przetworzenie danych dla czytelności (rozbicie zagnieżdżonego słownika kategorii)
+if not df_prod.empty:
+    df_prod['kategoria_nazwa'] = df_prod['kategorie'].apply(lambda x: x['nazwa'] if x else "Brak")
+    df_prod['kolor'] = df_prod['kategoria_nazwa'].apply(get_category_color)
+
+# --- TAB: STATYSTYKI ---
+with tabs[0]:
+    st.header("Stan magazynowy produktów")
+    if not df_prod.empty:
+        # Tworzenie wykresu Altair
+        chart = alt.Chart(df_prod).mark_bar().encode(
+            x=alt.X('nazwa:N', sort='-y', title='Produkt'),
+            y=alt.Y('liczba:Q', title='Ilość sztuk'),
+            color=alt.Color('kategoria_nazwa:N', 
+                            scale=alt.Scale(domain=list(df_prod['kategoria_nazwa'].unique()),
+                                          range=[get_category_color(c) for c in df_prod['kategoria_nazwa'].unique()]),
+                            title='Kategoria'),
+            tooltip=['nazwa', 'liczba', 'kategoria_nazwa', 'cena']
+        ).properties(height=400).interactive()
+        
+        st.altair_chart(chart, use_container_width=True)
+        
+        # Kluczowe wskaźniki (Metrics)
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("Suma produktów", int(df_prod['liczba'].sum()))
+        col_m2.metric("Liczba asortymentu", len(df_prod))
+        col_m3.metric("Najdroższy produkt", f"{df_prod['cena'].max()} zł")
     else:
-        st.info("Brak kategorii w bazie.")
+        st.info("Dodaj produkty, aby zobaczyć wykresy.")
 
 # --- TAB: PRODUKTY ---
-with tabs[0]:
-    st.header("Zarządzanie Produktami")
-
-    # Pobranie list kategorii do selectboxa
-    kat_list = conn.table("kategorie").select("id, nazwa").execute()
-    kat_options = {k['nazwa']: k['id'] for k in kat_list.data} if kat_list.data else {}
-
-    # Formularz dodawania produktu
+with tabs[1]:
+    st.header("Lista i Dodawanie Produktów")
+    
     with st.expander("➕ Dodaj nowy produkt"):
-        if not kat_options:
-            st.warning("Najpierw dodaj przynajmniej jedną kategorię!")
+        if df_kat.empty:
+            st.warning("Najpierw dodaj kategorię!")
         else:
             with st.form("add_product"):
-                nazwa_prod = st.text_input("Nazwa produktu")
-                liczba_prod = st.number_input("Liczba", min_value=0, step=1)
-                cena_prod = st.number_input("Cena", min_value=0.0, format="%.2f")
-                kat_wybrana = st.selectbox("Kategoria", options=list(kat_options.keys()))
+                n = st.text_input("Nazwa")
+                l = st.number_input("Ilość", min_value=0)
+                c = st.number_input("Cena", min_value=0.0)
+                k = st.selectbox("Kategoria", options=df_kat['nazwa'].tolist())
                 
-                submit_prod = st.form_submit_button("Zapisz produkt")
-                
-                if submit_prod and nazwa_prod:
-                    new_prod = {
-                        "nazwa": nazwa_prod,
-                        "liczba": liczba_prod,
-                        "cena": cena_prod,
-                        "kategoria_id": kat_options[kat_wybrana]
-                    }
-                    conn.table("produkty").insert(new_prod).execute()
-                    st.success(f"Dodano produkt: {nazwa_prod}")
+                if st.form_submit_button("Zapisz"):
+                    kat_id = int(df_kat[df_kat['nazwa'] == k]['id'].values[0])
+                    conn.table("produkty").insert({"nazwa": n, "liczba": l, "cena": c, "kategoria_id": kat_id}).execute()
                     st.rerun()
 
-    # Wyświetlanie i usuwanie produktów
-    # Join z tabelą kategorie, aby wyświetlić nazwę zamiast ID
-    prod_data = conn.table("produkty").select("*, kategorie(nazwa)").execute()
-    
-    if prod_data.data:
-        st.subheader("Lista produktów")
-        for p in prod_data.data:
-            col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 2, 1])
-            col1.write(f"**{p['nazwa']}**")
-            col2.write(f"Ilość: {p['liczba']}")
-            col3.write(f"{p['cena']} zł")
-            col4.write(f"📁 {p['kategorie']['nazwa'] if p['kategorie'] else 'Brak'}")
-            
-            if col5.button("Usuń", key=f"del_prod_{p['id']}"):
-                conn.table("produkty").delete().eq("id", p['id']).execute()
-                st.rerun()
-    else:
-        st.info("Brak produktów w bazie.")
+    if not df_prod.empty:
+        for _, row in df_prod.iterrows():
+            with st.container():
+                c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 2, 1])
+                c1.write(f"**{row['nazwa']}**")
+                c2.write(f"{row['liczba']} szt.")
+                c3.write(f"{row['cena']} zł")
+                
+                # Kolorowa etykieta kategorii
+                bg_color = row['kolor']
+                c4.markdown(f'<span style="background-color:{bg_color}; color:white; padding:2px 8px; border-radius:10px; font-size:12px;">{row["kategoria_nazwa"]}</span>', unsafe_allow_html=True)
+                
+                if c5.button("Usuń", key=f"del_p_{row['id']}"):
+                    conn.table("produkty").delete().eq("id", row['id']).execute()
+                    st.rerun()
+                st.divider()
+
+# --- TAB: KATEGORIE ---
+with tabs[2]:
+    st.header("Zarządzanie Kategoriami")
+    with st.form("add_cat"):
+        nk = st.text_input("Nazwa kategorii (np. Mleko, Elektronika)")
+        ok = st.text_area("Opis")
+        if st.form_submit_button("Dodaj kategorię"):
+            conn.table("kategorie").insert({"nazwa": nk, "opis": ok}).execute()
