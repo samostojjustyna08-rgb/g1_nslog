@@ -1,108 +1,148 @@
 import streamlit as st
-from st_supabase_connection import SupabaseConnection
+from supabase import create_client, Client
 import pandas as pd
-import altair as alt
+import plotly.express as px
 
-# Konfiguracja strony
-st.set_page_config(page_title="Baza Danych Produktów", layout="wide")
+# --- KONFIGURACJA STRONY ---
+st.set_page_config(page_title="Magazyn Produktów", layout="wide")
 
-# Inicjalizacja połączenia z Supabase
-conn = st.connection("supabase", type=SupabaseConnection)
+# --- POŁĄCZENIE Z BAZĄ DANYCH ---
+# Funkcja łączy się z Supabase używając sekretów ze Streamlit Cloud
+@st.cache_resource
+def init_connection():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-# Funkcja pomocnicza do mapowania kolorów kategorii
-def get_category_color(cat_name):
-    colors = {
-        "mleko": "#1E90FF",      # Niebieski
-        "elektronika": "#2E8B57", # Zielony
-        "owoce": "#FF4500",      # Pomarańczowy/Czerwony
-        "warzywa": "#32CD32",    # Limonkowy
-        "nabiał": "#F0E68C"       # Żółty/Khaki
-    }
-    # Zwróć kolor z mapy lub szary dla nieznanych
-    return colors.get(cat_name.lower(), "#808080")
+supabase = init_connection()
 
-st.title("📊 Baza Danych Produktów")
+# --- FUNKCJE POBIERAJĄCE DANE ---
+def get_data():
+    # Pobieramy produkty wraz z nazwą kategorii (dzięki relacji w bazie)
+    # Uwaga: Zakładam, że kolumna w bazie nazywa się 'minimalny_stan' lub 'minimalny stan'
+    # W Pythonie najlepiej używać nazw bez spacji.
+    response = supabase.table('produkty').select('*, kategorie(nazwa)').execute()
+    return response.data
 
-tabs = st.tabs(["📈 Statystyki i Wykresy", "📦 Produkty", "📁 Kategorie"])
+def get_categories():
+    response = supabase.table('kategorie').select('id, nazwa').execute()
+    return response.data
 
-# Pobranie danych do cache'owania w ramach sesji (ułatwia rysowanie wykresów)
-prod_query = conn.table("produkty").select("*, kategorie(nazwa)").execute()
-kat_query = conn.table("kategorie").select("*").execute()
+# --- GŁÓWNY WIDOK APLIKACJI ---
+st.title("📦 System Zarządzania Stanami Magazynowymi")
 
-df_prod = pd.DataFrame(prod_query.data) if prod_query.data else pd.DataFrame()
-df_kat = pd.DataFrame(kat_query.data) if kat_query.data else pd.DataFrame()
+# 1. Pobranie danych
+data = get_data()
+categories = get_categories()
 
-# Przetworzenie danych dla czytelności (rozbicie zagnieżdżonego słownika kategorii)
-if not df_prod.empty:
-    df_prod['kategoria_nazwa'] = df_prod['kategorie'].apply(lambda x: x['nazwa'] if x else "Brak")
-    df_prod['kolor'] = df_prod['kategoria_nazwa'].apply(get_category_color)
-
-# --- TAB: STATYSTYKI ---
-with tabs[0]:
-    st.header("Stan magazynowy produktów")
-    if not df_prod.empty:
-        # Tworzenie wykresu Altair
-        chart = alt.Chart(df_prod).mark_bar().encode(
-            x=alt.X('nazwa:N', sort='-y', title='Produkt'),
-            y=alt.Y('liczba:Q', title='Ilość sztuk'),
-            color=alt.Color('kategoria_nazwa:N', 
-                            scale=alt.Scale(domain=list(df_prod['kategoria_nazwa'].unique()),
-                                          range=[get_category_color(c) for c in df_prod['kategoria_nazwa'].unique()]),
-                            title='Kategoria'),
-            tooltip=['nazwa', 'liczba', 'kategoria_nazwa', 'cena']
-        ).properties(height=400).interactive()
-        
-        st.altair_chart(chart, use_container_width=True)
-        
-        # Kluczowe wskaźniki (Metrics)
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Suma produktów", int(df_prod['liczba'].sum()))
-        col_m2.metric("Liczba asortymentu", len(df_prod))
-        col_m3.metric("Najdroższy produkt", f"{df_prod['cena'].max()} zł")
-    else:
-        st.info("Dodaj produkty, aby zobaczyć wykresy.")
-
-# --- TAB: PRODUKTY ---
-with tabs[1]:
-    st.header("Lista i Dodawanie Produktów")
+if data:
+    # Konwersja do Pandas DataFrame dla łatwiejszej obróbki
+    df = pd.json_normalize(data)
     
-    with st.expander("➕ Dodaj nowy produkt"):
-        if df_kat.empty:
-            st.warning("Najpierw dodaj kategorię!")
+    # Przemianowanie kolumn dla czytelności (dopasuj do swoich nazw w bazie)
+    # Jeśli w bazie masz "minimalny stan" ze spacją, tutaj to obsłużymy
+    rename_map = {
+        'nazwa': 'Produkt',
+        'liczba': 'Ilość',
+        'cena': 'Cena',
+        'kategorie.nazwa': 'Kategoria',
+        'minimalny_stan': 'Min. Stan', 
+        'minimalny stan': 'Min. Stan' # Zabezpieczenie na wypadek spacji w nazwie kolumny
+    }
+    df = df.rename(columns=rename_map)
+    
+    # Jeśli po normalizacji brakuje kolumny 'Kategoria' (bo np. produkt nie ma kategorii), wypełnij braki
+    if 'Kategoria' not in df.columns:
+        df['Kategoria'] = 'Brak'
+
+    # --- KPI (Kluczowe Wskaźniki) ---
+    col1, col2, col3 = st.columns(3)
+    total_products = len(df)
+    total_stock = df['Ilość'].sum()
+    low_stock_count = df[df['Ilość'] <= df['Min. Stan']].shape[0]
+
+    col1.metric("Liczba produktów (rodzaje)", total_products)
+    col2.metric("Łącznie sztuk w magazynie", total_stock)
+    col3.metric("⚠️ Produkty poniżej minimum", low_stock_count, delta_color="inverse")
+
+    # --- WYKRES (Dopasowujący się do stanów) ---
+    st.subheader("📊 Aktualne stany magazynowe")
+    
+    # Wykres słupkowy: Oś X to produkty, Oś Y to Ilość, Kolor to Kategoria
+    fig = px.bar(
+        df, 
+        x='Produkt', 
+        y='Ilość', 
+        color='Kategoria',
+        text='Ilość',
+        title="Ilość produktów w podziale na kategorie",
+        color_discrete_sequence=px.colors.qualitative.Pastel
+    )
+    # Dodanie linii poziomej oznaczającej ogólny poziom ostrzegawczy (opcjonalnie)
+    fig.update_traces(textposition='outside')
+    st.plotly_chart(fig, use_container_width=True)
+
+    # --- TABELA DANYCH ---
+    st.subheader("Szczegółowa lista produktów")
+    
+    # Podświetlenie wierszy gdzie ilość jest niska
+    def highlight_low_stock(row):
+        # Sprawdzamy czy kolumna Min. Stan istnieje w DataFrame
+        if 'Min. Stan' in row and row['Ilość'] <= row['Min. Stan']:
+            return ['background-color: #ffcccc'] * len(row)
+        return [''] * len(row)
+
+    # Wyświetlamy tylko potrzebne kolumny
+    display_cols = ['Produkt', 'Kategoria', 'Cena', 'Ilość', 'Min. Stan']
+    # Filtrujemy tylko te kolumny, które faktycznie istnieją w df
+    available_cols = [c for c in display_cols if c in df.columns]
+    
+    st.dataframe(
+        df[available_cols].style.apply(highlight_low_stock, axis=1),
+        use_container_width=True
+    )
+
+else:
+    st.info("Baza produktów jest pusta. Dodaj pierwszy produkt poniżej.")
+
+# --- FORMULARZ DODAWANIA ---
+st.divider()
+st.subheader("➕ Dodaj nowy produkt")
+
+with st.form("add_product_form", clear_on_submit=True):
+    col_a, col_b = st.columns(2)
+    
+    with col_a:
+        new_name = st.text_input("Nazwa produktu")
+        # Tworzymy słownik {Nazwa Kategorii: ID Kategorii} do wyboru
+        cat_dict = {item['nazwa']: item['id'] for item in categories} if categories else {}
+        selected_cat_name = st.selectbox("Wybierz kategorię", list(cat_dict.keys()))
+        
+    with col_b:
+        new_price = st.number_input("Cena (PLN)", min_value=0.01, step=0.01)
+        new_qty = st.number_input("Ilość początkowa", min_value=1, step=1)
+        new_min_stock = st.number_input("Stan minimalny (alarm)", min_value=1, value=5)
+
+    submitted = st.form_submit_button("Zapisz produkt w bazie")
+
+    if submitted:
+        if new_name and selected_cat_name:
+            try:
+                # Przygotowanie danych do wysłania
+                # Używamy ID kategorii pobranego ze słownika
+                payload = {
+                    "nazwa": new_name,
+                    "cena": new_price,
+                    "liczba": new_qty,
+                    "minimalny_stan": new_min_stock, # Upewnij się, że w bazie masz 'minimalny_stan' lub 'minimalny stan'
+                    "kategoria_id": cat_dict[selected_cat_name]
+                }
+                
+                # Wysłanie do Supabase
+                supabase.table('produkty').insert(payload).execute()
+                st.success(f"Dodano produkt: {new_name}!")
+                st.rerun() # Odświeżenie strony żeby pokazać nowe dane
+            except Exception as e:
+                st.error(f"Wystąpił błąd podczas dodawania: {e}")
         else:
-            with st.form("add_product"):
-                n = st.text_input("Nazwa")
-                l = st.number_input("Ilość", min_value=0)
-                c = st.number_input("Cena", min_value=0.0)
-                k = st.selectbox("Kategoria", options=df_kat['nazwa'].tolist())
-                
-                if st.form_submit_button("Zapisz"):
-                    kat_id = int(df_kat[df_kat['nazwa'] == k]['id'].values[0])
-                    conn.table("produkty").insert({"nazwa": n, "liczba": l, "cena": c, "kategoria_id": kat_id}).execute()
-                    st.rerun()
-
-    if not df_prod.empty:
-        for _, row in df_prod.iterrows():
-            with st.container():
-                c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 2, 1])
-                c1.write(f"**{row['nazwa']}**")
-                c2.write(f"{row['liczba']} szt.")
-                c3.write(f"{row['cena']} zł")
-                
-                # Kolorowa etykieta kategorii
-                bg_color = row['kolor']
-                c4.markdown(f'<span style="background-color:{bg_color}; color:white; padding:2px 8px; border-radius:10px; font-size:12px;">{row["kategoria_nazwa"]}</span>', unsafe_allow_html=True)
-                
-                if c5.button("Usuń", key=f"del_p_{row['id']}"):
-                    conn.table("produkty").delete().eq("id", row['id']).execute()
-                    st.rerun()
-                st.divider()
-
-# --- TAB: KATEGORIE ---
-with tabs[2]:
-    st.header("Zarządzanie Kategoriami")
-    with st.form("add_cat"):
-        nk = st.text_input("Nazwa kategorii (np. Mleko, Elektronika)")
-        ok = st.text_area("Opis")
-        if st.form_submit_button("Dodaj kategorię"):
-            conn.table("kategorie").insert({"nazwa": nk, "opis": ok}).execute()
+            st.warning("Uzupełnij nazwę i wybierz kategorię.")
