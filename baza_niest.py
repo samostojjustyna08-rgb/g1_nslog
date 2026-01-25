@@ -3,15 +3,15 @@ from supabase import create_client, Client
 import pandas as pd
 import plotly.express as px
 
-# --- 1. KONFIGURACJA STRONY (Musi być na samym początku) ---
+# --- 1. KONFIGURACJA STRONY ---
 st.set_page_config(
-    page_title="Magazyn Manager",
+    page_title="System Magazynowy",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- 2. POŁĄCZENIE Z BAZĄ ---
+# --- 2. POŁĄCZENIE Z BAZĄ SUPABASE ---
 @st.cache_resource
 def init_connection():
     url = st.secrets["SUPABASE_URL"]
@@ -21,12 +21,12 @@ def init_connection():
 try:
     supabase = init_connection()
 except Exception as e:
-    st.error("Nie udało się połączyć z bazą danych. Sprawdź klucze API.")
+    st.error("Błąd połączenia z bazą danych. Sprawdź plik secrets.")
     st.stop()
 
 # --- 3. FUNKCJE POMOCNICZE ---
 def get_data():
-    # Pobieramy produkty
+    # Pobieramy produkty wraz z nazwą kategorii
     response = supabase.table('produkty').select('*, kategorie(nazwa)').order('id').execute()
     return response.data
 
@@ -43,17 +43,15 @@ def update_stock_in_db(product_id, new_total):
 
 # --- 4. GŁÓWNA APLIKACJA ---
 
-# Pasek boczny (Sidebar) - LOGO I FILTRY
+# --- PASEK BOCZNY (FILTRY) ---
 with st.sidebar:
     st.header("📦 Magazyn")
-    st.caption("Panel sterowania")
     st.divider()
     
-    # Odświeżanie
+    # Przycisk odświeżania
     if st.button("🔄 Odśwież dane", use_container_width=True):
         st.rerun()
     
-    st.divider()
     st.subheader("Filtrowanie")
 
 # Pobranie danych
@@ -61,22 +59,25 @@ raw_data = get_data()
 categories_data = get_categories()
 
 if raw_data:
-    # Przygotowanie DataFrame
+    # Konwersja danych do tabeli (DataFrame)
     df = pd.json_normalize(raw_data)
     
-    # Mapowanie nazw kolumn
+    # Zmiana nazw kolumn na czytelniejsze
     rename_map = {
         'nazwa': 'Produkt',
         'liczba': 'Ilość',
         'cena': 'Cena',
         'kategorie.nazwa': 'Kategoria',
         'minimalny_stan': 'Min. Stan',
-        'minimalny stan': 'Min. Stan'
+        'minimalny stan': 'Min. Stan' # Zabezpieczenie na wypadek spacji w nazwie
     }
     df = df.rename(columns=rename_map)
+    
+    # Uzupełnienie braków
     if 'Kategoria' not in df.columns: df['Kategoria'] = 'Inne'
+    if 'Min. Stan' not in df.columns: df['Min. Stan'] = 0
 
-    # Wyszukiwarka w pasku bocznym
+    # Filtrowanie w pasku bocznym
     search_query = st.sidebar.text_input("🔍 Szukaj produktu:", placeholder="Nazwa...")
     cat_filter = st.sidebar.multiselect("Filtruj kategorię:", options=df['Kategoria'].unique())
 
@@ -87,93 +88,135 @@ if raw_data:
     if cat_filter:
         df_filtered = df_filtered[df_filtered['Kategoria'].isin(cat_filter)]
 
-    # --- PANEL GŁÓWNY (DASHBOARD) ---
-    st.title("Przegląd Magazynu")
+    # --- DASHBOARD (GÓRA STRONY) ---
+    st.title("Stan Magazynowy")
     
-    # KPI - Karty statystyk
+    # Statystyki (KPI)
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     
     total_items = df_filtered['Ilość'].sum()
     total_value = (df_filtered['Ilość'] * df_filtered['Cena']).sum()
-    low_stock_count = 0
-    if 'Min. Stan' in df.columns:
-        low_stock_count = len(df_filtered[df_filtered['Ilość'] <= df_filtered['Min. Stan']])
+    low_stock_items = df_filtered[df_filtered['Ilość'] < df_filtered['Min. Stan']]
 
     kpi1.metric("📦 Liczba produktów", len(df_filtered))
-    kpi2.metric("📊 Sztuk łącznie", f"{total_items}")
+    kpi2.metric("📊 Sztuk łącznie", int(total_items))
     kpi3.metric("💰 Wartość magazynu", f"{total_value:,.2f} zł".replace(",", " "))
-    kpi4.metric("⚠️ Niskie stany", low_stock_count, delta_color="inverse")
+    kpi4.metric("⚠️ Poniżej minimum", len(low_stock_items), delta_color="inverse")
 
     st.divider()
 
     # ZAKŁADKI
-    tab_list, tab_ops, tab_add = st.tabs(["📋 Lista i Wykresy", "🛠️ Szybkie Operacje", "➕ Dodaj Nowy"])
+    tab_list, tab_ops, tab_add = st.tabs(["📋 Lista i Wykresy", "🛠️ Ruch Magazynowy", "➕ Dodaj Nowy"])
 
     # --- ZAKŁADKA 1: TABELA + WYKRES ---
-   with tab_list:
+    with tab_list:
         col_table, col_chart = st.columns([1.5, 1])
         
         with col_table:
             st.subheader("Szczegóły produktów")
-            
-            # 1. Definicja funkcji kolorującej
+
+            # --- LOGIKA KOLOROWANIA WIERSZY ---
             def color_stock(row):
-                # Sprawdzamy czy kolumna Min. Stan istnieje (dla bezpieczeństwa)
-                min_val = row.get('Min. Stan', 0) 
-                
+                min_val = row.get('Min. Stan', 0)
+                # Jeśli ilość jest mniejsza niż minimum -> Czerwony
                 if row['Ilość'] < min_val:
-                    # Czerwone tło (pastelowe) dla niskiego stanu
                     return ['background-color: #ffcccc; color: black'] * len(row)
+                # W przeciwnym razie -> Zielony
                 else:
-                    # Zielone tło (pastelowe) gdy stan jest OK (równy lub wyższy)
                     return ['background-color: #d4edda; color: black'] * len(row)
 
-            # 2. Wybór kolumn do wyświetlenia
+            # Wybór kolumn
             display_cols = ['Produkt', 'Kategoria', 'Cena', 'Ilość', 'Min. Stan']
             
-            # 3. Nakładanie stylów i formatowania
-            # Tworzymy obiekt "Styler", który trzyma informacje o kolorach i formacie liczb
+            # Tworzenie stylizowanej tabeli
+            # .apply -> nakłada kolory
+            # .format -> naprawia "dużo zer po kropce"
             styled_df = df_filtered[display_cols].style\
                 .apply(color_stock, axis=1)\
                 .format({
-                    "Cena": "{:.2f} zł",   # Tu naprawiamy format ceny (np. 12.00 zł)
-                    "Ilość": "{:.0f}",     # Ilość jako liczba całkowita
+                    "Cena": "{:.2f} zł",   # Formatowanie waluty: 12.50 zł
+                    "Ilość": "{:.0f}",     # Formatowanie ilości: 100
                     "Min. Stan": "{:.0f}"
                 })
 
-            # 4. Wyświetlenie pokolorowanej tabeli
             st.dataframe(
                 styled_df,
                 use_container_width=True,
-                height=400,
-                column_config={
-                    "Produkt": st.column_config.TextColumn("Nazwa Produktu"),
-                }
+                height=500
             )
 
         with col_chart:
-            st.subheader("Struktura magazynu")
+            st.subheader("Wykres stanów")
             if not df_filtered.empty:
-                # Wykres kołowy
-                fig = px.pie(df_filtered, values='Ilość', names='Kategoria', hole=0.4)
-                fig.update_layout(margin=dict(t=0, b=0, l=0, r=0)) # Zmniejszenie marginesów
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Wykres słupkowy z kolorowaniem warunkowym na wykresie
-                # Dodajemy pomocniczą kolumnę koloru tylko dla wykresu
+                # Przygotowanie danych do wykresu (dodajemy kolumnę koloru)
                 df_chart = df_filtered.copy()
-                df_chart['Status'] = df_chart.apply(lambda x: 'Niski stan' if x['Ilość'] < x.get('Min. Stan', 0) else 'OK', axis=1)
-                
-                fig2 = px.bar(
+                df_chart['Status'] = df_chart.apply(
+                    lambda x: 'Niski stan' if x['Ilość'] < x['Min. Stan'] else 'OK', axis=1
+                )
+
+                # Wykres słupkowy
+                fig = px.bar(
                     df_chart, 
                     x='Produkt', 
-                    y='Ilość', 
-                    color='Status', # Kolor słupka zależy od statusu
+                    y='Ilość',
+                    color='Status', # Kolor zależny od statusu
                     color_discrete_map={'OK': '#28a745', 'Niski stan': '#dc3545'}, # Zielony i Czerwony
+                    text='Ilość',
                     title="Ranking ilości"
                 )
+                fig.update_traces(textposition='outside')
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Wykres kołowy (udział kategorii)
+                fig2 = px.pie(df_filtered, values='Ilość', names='Kategoria', hole=0.4, title="Udział kategorii")
                 st.plotly_chart(fig2, use_container_width=True)
-    # --- ZAKŁADKA 3: DODAWANIE ---
+
+    # --- ZAKŁADKA 2: SZYBKIE OPERACJE ---
+    with tab_ops:
+        st.write("### Zmień stan magazynowy")
+        
+        # Lista wyboru z podglądem aktualnego stanu
+        product_options = {f"{row['Produkt']} | Stan: {row['Ilość']} szt.": row for index, row in df.iterrows()}
+        selected_key = st.selectbox("Wybierz produkt:", list(product_options.keys()))
+        
+        if selected_key:
+            item = product_options[selected_key]
+            st.info(f"Wybrano: **{item['Produkt']}** | Cena: {item['Cena']:.2f} zł")
+
+            col_in, col_out = st.columns(2)
+
+            # Karta Dostawy (Zielona)
+            with col_in:
+                with st.container(border=True):
+                    st.success("📥 **DOSTAWA (Przyjęcie)**")
+                    qty_add = st.number_input("Ile dodać?", min_value=1, value=1, key="q_add")
+                    
+                    if st.button("Zatwierdź Dostawę", type="primary", use_container_width=True):
+                        new_val = item['Ilość'] + qty_add
+                        if update_stock_in_db(item['id'], new_val):
+                            st.toast(f"✅ Dodano {qty_add} szt. Nowy stan: {new_val}", icon="📦")
+                            st.rerun()
+                        else:
+                            st.error("Błąd zapisu w bazie.")
+
+            # Karta Wydania (Czerwona)
+            with col_out:
+                with st.container(border=True):
+                    st.error("📤 **SPRZEDAŻ (Wydanie)**")
+                    qty_sub = st.number_input("Ile wydać?", min_value=1, value=1, key="q_sub")
+                    
+                    if st.button("Zatwierdź Wydanie", type="secondary", use_container_width=True):
+                        new_val = item['Ilość'] - qty_sub
+                        if new_val < 0:
+                            st.warning("⚠️ Nie możesz wydać więcej niż masz!")
+                        else:
+                            if update_stock_in_db(item['id'], new_val):
+                                st.toast(f"✅ Wydano {qty_sub} szt. Nowy stan: {new_val}", icon="💸")
+                                st.rerun()
+                            else:
+                                st.error("Błąd zapisu w bazie.")
+
+    # --- ZAKŁADKA 3: DODAWANIE NOWEGO PRODUKTU ---
     with tab_add:
         st.write("### Rejestracja nowego produktu")
         with st.form("new_product_form", clear_on_submit=True):
@@ -186,11 +229,12 @@ if raw_data:
                 n_cat = st.selectbox("Kategoria", list(cat_dict.keys()))
             
             with col_f2:
-                n_price = st.number_input("Cena sprzedaży (PLN)", min_value=0.01, step=0.01, format="%.2f")
+                # Format %.2f zapewnia, że użytkownik wpisuje np. 12.50
+                n_price = st.number_input("Cena (PLN)", min_value=0.01, step=0.01, format="%.2f")
                 n_qty = st.number_input("Stan początkowy", min_value=0, step=1)
                 n_min = st.number_input("Alarm niskiego stanu (szt.)", min_value=1, value=5)
 
-            submitted = st.form_submit_button("💾 Zapisz produkt w bazie", use_container_width=True)
+            submitted = st.form_submit_button("💾 Zapisz produkt", use_container_width=True)
             
             if submitted:
                 if n_name and n_cat:
@@ -210,4 +254,4 @@ if raw_data:
                     st.warning("Podaj nazwę produktu.")
 
 else:
-    st.warning("Brak danych w bazie. Dodaj produkty przez Supabase lub zakładkę 'Dodaj Nowy'.")
+    st.info("Baza danych jest pusta. Dodaj pierwszy produkt w zakładce 'Dodaj Nowy'.")
